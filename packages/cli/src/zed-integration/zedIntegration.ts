@@ -4,42 +4,45 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as acp from '@agentclientprotocol/sdk';
 import type {
   Config,
-  GeminiChat,
-  ToolResult,
-  ToolCallConfirmationDetails,
   FilterFilesOptions,
-} from '@google/gemini-cli-core';
+  GeminiChat,
+  ToolCallConfirmationDetails,
+  ToolResult,
+
+  ResumedSessionData} from '@google/gemini-cli-core';
 import {
   AuthType,
-  logToolCall,
-  convertToFunctionResponse,
-  ToolConfirmationOutcome,
   clearCachedCredentialFile,
-  isNodeError,
-  getErrorMessage,
-  isWithinRoot,
-  getErrorStatus,
-  MCPServerConfig,
-  DiscoveredMCPTool,
-  StreamEventType,
-  ToolCallEvent,
+  convertToFunctionResponse,
+  createWorkingStdio,
   debugLogger,
+  DiscoveredMCPTool,
+  getErrorMessage,
+  getErrorStatus,
+  isNodeError,
+  isWithinRoot,
+  logToolCall,
+  MCPServerConfig,
   ReadManyFilesTool,
   resolveModel,
-  createWorkingStdio,
   startupProfiler,
+  StreamEventType,
+  ToolCallEvent,
+  ToolConfirmationOutcome,
 } from '@google/gemini-cli-core';
-import * as acp from '@agentclientprotocol/sdk';
-import { AcpFileSystemService } from './fileSystemService.js';
-import { Readable, Writable } from 'node:stream';
-import type { Content, Part, FunctionCall } from '@google/genai';
-import type { LoadedSettings } from '../config/settings.js';
-import { SettingScope } from '../config/settings.js';
+import type { Content, FunctionCall, Part } from '@google/genai';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { Readable, Writable } from 'node:stream';
 import { z } from 'zod';
+import type { LoadedSettings } from '../config/settings.js';
+import { SettingScope } from '../config/settings.js';
+import { convertSessionToHistoryFormats } from '../ui/hooks/useSessionBrowser.js';
+import { SessionSelector } from '../utils/sessionUtils.js';
+import { AcpFileSystemService } from './fileSystemService.js';
 
 import { randomUUID } from 'node:crypto';
 import type { CliArgs } from '../config/config.js';
@@ -137,7 +140,41 @@ export class GeminiAgent {
     cwd,
     mcpServers,
   }: acp.NewSessionRequest): Promise<acp.NewSessionResponse> {
-    const sessionId = randomUUID();
+    let sessionId = randomUUID();
+    let resumedSessionData: ResumedSessionData | undefined;
+
+    // Attempt to resume if the --resume flag was passed
+    if (this.argv.resume) {
+      try {
+        // We need a temporary config to initialize the SessionSelector
+        // This config does NOT need to be fully initialized with profiles/etc,
+        // just enough to know the storage paths.
+        const tempConfig = await loadCliConfig(
+          { ...this.settings.merged },
+          'temp-session-id',
+          this.argv,
+          { cwd },
+        );
+        const sessionSelector = new SessionSelector(tempConfig);
+        const result = await sessionSelector.resolveSession(this.argv.resume);
+
+        sessionId = result.sessionData.sessionId;
+        resumedSessionData = {
+          conversation: result.sessionData,
+          filePath: result.sessionPath,
+        };
+        debugLogger.log(`Resuming session ID: ${sessionId}`);
+      } catch (error) {
+        // If resumption fails, we log it and proceed with a new session (standard CLI behavior usually exits,
+        // but here we might want to be robust. However, user EXPLICITLY asked for resume.)
+        // Let's throw to create a visible error if they asked for a specific session that doesn't exist.
+        throw new acp.RequestError(
+          -32602,
+          `Failed to resume session: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+
     const config = await this.newSessionConfig(sessionId, cwd, mcpServers);
 
     let isAuthenticated = false;
@@ -167,7 +204,17 @@ export class GeminiAgent {
     }
 
     const geminiClient = config.getGeminiClient();
-    const chat = await geminiClient.startChat();
+    let chat;
+    if (resumedSessionData) {
+      const history = convertSessionToHistoryFormats(
+        resumedSessionData.conversation.messages,
+      ).clientHistory;
+      await geminiClient.resumeChat(history, resumedSessionData);
+      chat = geminiClient.getChat();
+    } else {
+      chat = await geminiClient.startChat();
+    }
+
     const session = new Session(sessionId, chat, config, this.connection);
     this.sessions.set(sessionId, session);
 
